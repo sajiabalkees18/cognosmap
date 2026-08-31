@@ -278,6 +278,261 @@ def extract_model_path(root):
         return ""
     return _text_of(el[0])
 
+def detect_cognos_xml_type(xml_text):
+    """Peeks at the root tag so one upload box can accept both report XML
+    and framework model XML - no separate upload needed."""
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return "invalid"
+    root_tag = _local(root.tag)
+    if root_tag == "report":
+        return "report"
+    if root_tag == "frameworkManagerModel":
+        return "framework_model"
+    return "unknown"
+
+
+def extract_package_name_from_model_path(model_path):
+    """/content/folder[@name='Samples']/package[@name='GO Sales'] -> 'GO Sales'"""
+    m = re.search(r"package\[@name='([^']*)'\]", model_path or "")
+    return m.group(1) if m else ""
+
+
+_FM_FIELD_PATH_RE = re.compile(r"^\[([^\]]+)\]\.\[([^\]]+)\]\.\[([^\]]+)\]$")
+
+
+def parse_fm_field_expression(expr):
+    """[Sales].[Retailers].[Region] -> (namespace_or_layer, query_subject, column).
+    Matching later ignores the first segment (it may be a namespace not
+    explicitly modeled), and validates on query-subject + column name."""
+    m = _FM_FIELD_PATH_RE.match((expr or "").strip())
+    if m:
+        return m.group(1), m.group(2), m.group(3)
+    return None, None, None
+
+
+def parse_framework_model(xml_text):
+    """Main entry point for Framework Manager model XML - mirrors
+    parse_cognos_report()'s shape/spirit."""
+    root = ET.fromstring(xml_text)
+
+    result = {
+        "project_name": root.get("projectName", ""),
+        "framework_name": root.get("frameworkName", ""),
+        "version": root.get("version", ""),
+        "query_mode": root.get("queryMode", ""),
+        "description": _text_of(_find_child(root, "description")),
+        "data_sources": [],
+        "packages": [],
+        "layers": [],
+        "query_subjects": [],
+        "query_items": [],
+        "relationships": [],
+        "filters": [],
+        "security_filters": [],
+    }
+
+    ds_root = _find_child(root, "dataSources")
+    if ds_root is not None:
+        for ds in _iter_all(ds_root, "dataSource"):
+            result["data_sources"].append({
+                "name": ds.get("name", ""), "type": ds.get("type", ""),
+                "provider": ds.get("provider", ""), "catalog": ds.get("catalog", ""),
+                "schema": ds.get("schema", ""),
+            })
+
+    pkgs_root = _find_child(root, "packages")
+    if pkgs_root is not None:
+        for pkg in _iter_all(pkgs_root, "package"):
+            included_layers = []
+            inc_root = _find_child(pkg, "includedLayers")
+            if inc_root is not None:
+                included_layers = [lr.get("name", "") for lr in _iter_all(inc_root, "layerRef")]
+            result["packages"].append({
+                "name": pkg.get("name", ""),
+                "published_name": pkg.get("publishedName", ""),
+                "description": _text_of(_find_child(pkg, "description")),
+                "included_layers": included_layers,
+            })
+
+    layers_root = _find_child(root, "layers")
+    if layers_root is not None:
+        for layer in _iter_all(layers_root, "layer"):
+            layer_name = layer.get("name", "")
+            layer_type = layer.get("type", "")
+            qs_names = []
+
+            qs_root = _find_child(layer, "querySubjects")
+            if qs_root is not None:
+                for qs in _iter_all(qs_root, "querySubject"):
+                    qs_name = qs.get("name", "")
+                    qs_names.append(qs_name)
+
+                    source_subjects = []
+                    ss_root = _find_child(qs, "sourceSubjects")
+                    if ss_root is not None:
+                        source_subjects = [s.get("name", "") for s in _iter_all(ss_root, "sourceSubjectRef")]
+
+                    result["query_subjects"].append({
+                        "layer": layer_name, "layer_type": layer_type, "name": qs_name,
+                        "type": qs.get("type", ""), "category": qs.get("category", ""),
+                        "subcategory": qs.get("subcategory", ""),
+                        "physical_table": qs.get("physicalTable", ""),
+                        "source_subjects": source_subjects,
+                    })
+
+                    qi_root = _find_child(qs, "queryItems")
+                    if qi_root is not None:
+                        for qi in _iter_all(qi_root, "queryItem"):
+                            result["query_items"].append({
+                                "layer": layer_name, "query_subject": qs_name,
+                                "category": qs.get("category", ""), "subcategory": qs.get("subcategory", ""),
+                                "name": qi.get("name", ""), "data_type": qi.get("dataType", ""),
+                                "usage": qi.get("usage", ""), "regular_aggregate": qi.get("regularAggregate", ""),
+                                "is_key": qi.get("isKey", "false"), "nullable": qi.get("nullable", "true"),
+                                "hidden": qi.get("hidden", "false"), "physical_column": qi.get("physicalColumn", ""),
+                                "format": qi.get("format", ""),
+                                "expression": _text_of(_find_child(qi, "expression")),
+                            })
+
+            result["layers"].append({
+                "name": layer_name, "type": layer_type,
+                "description": _text_of(_find_child(layer, "description")),
+                "query_subject_names": qs_names,
+            })
+
+    rels_root = _find_child(root, "relationships")
+    if rels_root is not None:
+        for rel in _iter_all(rels_root, "relationship"):
+            result["relationships"].append({
+                "name": rel.get("name", ""), "layer": rel.get("layer", ""),
+                "left_subject": rel.get("leftSubject", ""), "right_subject": rel.get("rightSubject", ""),
+                "left_cardinality": rel.get("leftCardinality", ""), "right_cardinality": rel.get("rightCardinality", ""),
+                "join_type": rel.get("joinType", ""),
+                "expression": _text_of(_find_child(rel, "expression")),
+                "foreign_key": _text_of(_find_child(rel, "foreignKey")),
+                "primary_key": _text_of(_find_child(rel, "primaryKey")),
+            })
+
+    filters_root = _find_child(root, "filters")
+    if filters_root is not None:
+        for f in _iter_all(filters_root, "filter"):
+            result["filters"].append({
+                "name": f.get("name", ""), "layer": f.get("layer", ""),
+                "subject": f.get("subject", ""), "type": f.get("type", ""),
+                "expression": _text_of(_find_child(f, "expression")),
+            })
+
+    security_root = _find_child(root, "security")
+    if security_root is not None:
+        for sf in _iter_all(security_root, "securityFilter"):
+            result["security_filters"].append({
+                "name": sf.get("name", ""), "subject": sf.get("subject", ""),
+                "type": sf.get("type", ""), "expression": _text_of(_find_child(sf, "expression")),
+                "note": _text_of(_find_child(sf, "note")),
+            })
+
+    return result
+
+
+def match_report_to_framework(report_model_path, framework_model):
+    """Returns the matching package dict if the report's modelPath package
+    name matches one defined in the uploaded framework model, else None."""
+    if framework_model is None:
+        return None
+    package_name = extract_package_name_from_model_path(report_model_path)
+    if not package_name:
+        return None
+    for pkg in framework_model["packages"]:
+        if pkg["name"] == package_name or pkg["published_name"] == package_name:
+            return pkg
+    return None
+
+
+def validate_report_against_framework(parsed_report, framework_model):
+    """Cross-checks each field a report references against real query
+    subjects/items in the framework model. Matches on query-subject name +
+    column name (ignores the leading bracket segment, since it may be a
+    namespace not explicitly modeled). Empty list = fully verified."""
+    issues = []
+    if framework_model is None:
+        return issues
+
+    subject_items = defaultdict(set)
+    for qi in framework_model["query_items"]:
+        subject_items[qi["query_subject"].strip().upper()].add(qi["name"].strip().upper())
+    known_subjects = {qs["name"].strip().upper() for qs in framework_model["query_subjects"]}
+
+    for q in parsed_report.get("queries", []):
+        for item in q["data_items"]:
+            expr = item["expression"]
+            if not expr:
+                continue
+            _, subject, column = parse_fm_field_expression(expr)
+            if subject is None:
+                continue
+            subj_upper, col_upper = subject.strip().upper(), column.strip().upper()
+            if subj_upper not in known_subjects:
+                issues.append(f"Field '{item['field']}' references unknown query subject '{subject}'")
+            elif col_upper not in subject_items.get(subj_upper, set()):
+                issues.append(f"Field '{item['field']}' references unknown column '{column}' in query subject '{subject}'")
+
+    return issues
+
+
+def build_framework_overview_df(fm):
+    return pd.DataFrame([{
+        "Framework Name": fm["framework_name"], "Project Name": fm["project_name"],
+        "Query Mode": fm["query_mode"], "Version": fm["version"],
+        "Layers": len(fm["layers"]), "Query Subjects": len(fm["query_subjects"]),
+        "Columns": len(fm["query_items"]), "Relationships": len(fm["relationships"]),
+        "Packages": len(fm["packages"]),
+    }])
+
+
+def build_framework_packages_df(fm):
+    return pd.DataFrame([{
+        "Package Name": p["name"], "Published Name": p["published_name"],
+        "Description": p["description"], "Included Layers": ", ".join(p["included_layers"]),
+    } for p in fm["packages"]])
+
+
+def build_framework_query_subjects_df(fm):
+    return pd.DataFrame([{
+        "Layer": qs["layer"], "Layer Type": qs["layer_type"], "Query Subject": qs["name"],
+        "Type": qs["type"], "Category": qs["category"], "Subcategory": qs["subcategory"],
+        "Physical Table": qs["physical_table"], "Source Subjects": ", ".join(qs["source_subjects"]),
+    } for qs in fm["query_subjects"]])
+
+
+def build_framework_columns_df(fm):
+    return pd.DataFrame([{
+        "Layer": qi["layer"], "Query Subject": qi["query_subject"], "Category": qi["category"],
+        "Subcategory": qi["subcategory"], "Column Name": qi["name"], "Data Type": qi["data_type"],
+        "Usage": qi["usage"], "Aggregate": qi["regular_aggregate"], "Is Key": qi["is_key"],
+        "Hidden": qi["hidden"], "Physical Column": qi["physical_column"], "Format": qi["format"],
+        "Expression": qi["expression"],
+    } for qi in fm["query_items"]])
+
+
+def build_framework_relationships_df(fm):
+    return pd.DataFrame([{
+        "Layer": r["layer"], "Relationship": r["name"], "Left Subject": r["left_subject"],
+        "Right Subject": r["right_subject"], "Left Cardinality": r["left_cardinality"],
+        "Right Cardinality": r["right_cardinality"], "Join Type": r["join_type"],
+        "Expression": r["expression"], "Foreign Key": r["foreign_key"], "Primary Key": r["primary_key"],
+    } for r in fm["relationships"]])
+
+
+def build_framework_filters_security_df(fm):
+    rows = [{"Type": "Standalone Filter", "Name": f["name"], "Layer": f["layer"],
+             "Subject": f["subject"], "Expression": f["expression"]} for f in fm["filters"]]
+    rows += [{"Type": "Security Filter", "Name": sf["name"], "Layer": "",
+              "Subject": sf["subject"], "Expression": sf["expression"]} for sf in fm["security_filters"]]
+    return pd.DataFrame(rows)
+
+
 
 def parse_cognos_report(xml_text):
     """
@@ -320,6 +575,8 @@ def parse_cognos_report(xml_text):
     result["source_tables"] = sorted(tables_touched)
 
     return result
+
+
 
 
 # ============================================================================
@@ -1551,7 +1808,7 @@ def build_validation_df(report_name, issues):
     return pd.DataFrame(rows)
 
 
-def build_excel_workbook(overview_df, fields_df, filters_df, prompts_df, drillthroughs_df, viz_df, controls_df, validation_df):
+def build_excel_workbook(overview_df, fields_df, filters_df, prompts_df, drillthroughs_df, viz_df, controls_df, validation_df, framework_model=None):
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         overview_df.to_excel(writer, sheet_name="Overview", index=False)
@@ -1569,6 +1826,28 @@ def build_excel_workbook(overview_df, fields_df, filters_df, prompts_df, drillth
             controls_df.to_excel(writer, sheet_name="Custom Controls", index=False)
         if not validation_df.empty:
             validation_df.to_excel(writer, sheet_name="Validation", index=False)
+
+        if framework_model is not None:
+            fw_overview_df = build_framework_overview_df(framework_model)
+            fw_packages_df = build_framework_packages_df(framework_model)
+            fw_subjects_df = build_framework_query_subjects_df(framework_model)
+            fw_columns_df = build_framework_columns_df(framework_model)
+            fw_relationships_df = build_framework_relationships_df(framework_model)
+            fw_filters_security_df = build_framework_filters_security_df(framework_model)
+
+            if not fw_overview_df.empty:
+                fw_overview_df.to_excel(writer, sheet_name="Framework Overview", index=False)
+            if not fw_packages_df.empty:
+                fw_packages_df.to_excel(writer, sheet_name="Framework Packages", index=False)
+            if not fw_subjects_df.empty:
+                fw_subjects_df.to_excel(writer, sheet_name="Framework Query Subjects", index=False)
+            if not fw_columns_df.empty:
+                fw_columns_df.to_excel(writer, sheet_name="Framework Columns", index=False)
+            if not fw_relationships_df.empty:
+                fw_relationships_df.to_excel(writer, sheet_name="Framework Relationships", index=False)
+            if not fw_filters_security_df.empty:
+                fw_filters_security_df.to_excel(writer, sheet_name="Framework Filters-Security", index=False)
+
     output.seek(0)
     return output
 
@@ -1623,18 +1902,41 @@ if submit:
     parsed_by_report = {}
     errors = []
 
-    progress = st.progress(0)
-    total = len(uploaded_reports)
+    # First pass: separate framework model file(s) from report files.
+    report_files = []
+    framework_model = None
+    framework_model_source_name = ""
 
-    for idx, uploaded_file in enumerate(uploaded_reports, start=1):
-        report_name = uploaded_file.name
+    for uploaded_file in uploaded_reports:
+        xml_text = uploaded_file.read().decode("utf-8", errors="replace")
+        file_type = detect_cognos_xml_type(xml_text)
+
+        if file_type == "framework_model":
+            if framework_model is not None:
+                st.warning(f"Multiple framework model files uploaded. Using '{framework_model_source_name}'; ignoring '{uploaded_file.name}'.")
+            else:
+                try:
+                    framework_model = parse_framework_model(xml_text)
+                    framework_model_source_name = uploaded_file.name
+                except Exception as e:
+                    errors.append(f"{uploaded_file.name}: failed to parse as framework model: {e}")
+        elif file_type == "report":
+            report_files.append((uploaded_file.name, xml_text))
+        else:
+            errors.append(f"{uploaded_file.name}: unrecognized XML root, skipped")
+
+    progress = st.progress(0)
+    total = len(report_files) or 1
+
+    for idx, (report_name, xml_text) in enumerate(report_files, start=1):
         try:
-            xml_text = uploaded_file.read().decode("utf-8", errors="replace")
             parsed = parse_cognos_report(xml_text)
 
             validation_issues = []
             if data_module_schema is not None:
                 validation_issues = validate_report_against_model(parsed, data_module_schema)
+            if framework_model is not None:
+                validation_issues = validation_issues + validate_report_against_framework(parsed, framework_model)
 
             parsed_by_report[report_name] = (parsed, validation_issues)
 
@@ -1663,6 +1965,7 @@ if submit:
     workbook = build_excel_workbook(
         overview_df, fields_df, filters_df, prompts_df,
         drillthroughs_df, viz_df, controls_df, validation_df,
+        framework_model,
     )
     fn = output_name if output_name.lower().endswith(".xlsx") else f"{output_name}.xlsx"
 
@@ -1676,6 +1979,7 @@ if submit:
         "parsed_by_report": parsed_by_report, "workbook": workbook, "fn": fn,
         "errors": errors, "data_module_schema": data_module_schema,
         "duplicate_df": duplicate_df, "duplicate_counts": cognos_duplicate_counts(duplicate_records),
+        "framework_model": framework_model, "framework_model_source_name": framework_model_source_name,
     }
 
 result = st.session_state.get("cognosmap_result")
@@ -1694,6 +1998,24 @@ if result:
         d3.metric("Same Data Source", dup_counts.get("same_source", 0))
         d4.metric("Unique", dup_counts.get("unique", 0))
         show_table_or_info(result.get("duplicate_df"), "No duplicate data available.")
+
+    framework_model = result.get("framework_model")
+    if framework_model is not None:
+        st.markdown('<div class="section-label">Framework Model</div>', unsafe_allow_html=True)
+        st.caption(f"Parsed from: {result.get('framework_model_source_name', '')}")
+        show_table_or_info(build_framework_overview_df(framework_model), "No framework model data.")
+
+        fm_tabs = st.tabs(["Packages", "Query Subjects", "Columns", "Relationships", "Filters & Security"])
+        with fm_tabs[0]:
+            show_table_or_info(build_framework_packages_df(framework_model), "No packages found.")
+        with fm_tabs[1]:
+            show_table_or_info(build_framework_query_subjects_df(framework_model), "No query subjects found.")
+        with fm_tabs[2]:
+            show_table_or_info(build_framework_columns_df(framework_model), "No columns found.", large=True)
+        with fm_tabs[3]:
+            show_table_or_info(build_framework_relationships_df(framework_model), "No relationships found.")
+        with fm_tabs[4]:
+            show_table_or_info(build_framework_filters_security_df(framework_model), "No filters or security rules found.")
 
     dm_schema = result.get("data_module_schema")
     if dm_schema is not None:
@@ -1727,6 +2049,14 @@ if result:
             len(parsed["fields"]), len(parsed["custom_controls"]), len(validation_issues)
         )
 
+        matched_package = match_report_to_framework(parsed['model_path'], result.get("framework_model"))
+        if result.get("framework_model") is None:
+            framework_badge = badge('No framework model uploaded', '')
+        elif matched_package:
+            framework_badge = badge(f"Framework: {matched_package['name']}", 'ok')
+        else:
+            framework_badge = badge('No matching package in uploaded framework model', 'review')
+
         st.markdown(
             f"""
             <div class="report-header">
@@ -1735,6 +2065,7 @@ if result:
                 <p><strong>Source tables:</strong> {escape(', '.join(parsed['source_tables']) or 'None detected')}</p>
                 {badge(f'Risk: {risk_label}', risk_level)}
                 {badge('Verified' if not validation_issues else f'{len(validation_issues)} validation issue(s)', 'ok' if not validation_issues else 'review')}
+                {framework_badge}
             </div>
             """,
             unsafe_allow_html=True,
