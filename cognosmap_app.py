@@ -1583,19 +1583,22 @@ def badge(label, level=''):
 def show_table_or_info(df, message, large=False, height=None):
     """Same styled-table pattern as KashMap: small tables get the orange
     kash-table HTML treatment, large ones stay as normal Streamlit dataframes.
-    height defaults to None (auto-size) rather than the string "content" -
-    some Streamlit versions require height to be an int or None, not a string."""
+    height is only passed through when explicitly set - newer Streamlit
+    versions reject height=None outright (must be an int or "auto")."""
     if df is None or df.empty:
         st.info(message)
         return
 
     if large or len(df) > 150:
-        st.dataframe(df, use_container_width=True, hide_index=True, height=height)
+        if height is not None:
+            st.dataframe(df, use_container_width=True, hide_index=True, height=height)
+        else:
+            st.dataframe(df, use_container_width=True, hide_index=True)
         return
 
     html = df.to_html(index=False, escape=True, classes="kash-table", border=0)
     st.markdown(f'<div class="kash-table-wrap">{html}</div>', unsafe_allow_html=True)
-
+    
 
 st.markdown(
     """
